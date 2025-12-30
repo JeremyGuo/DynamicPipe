@@ -1,4 +1,4 @@
-## ModularDP
+## DynamicPipe
 
 一个轻量的 C++17 **模块化流水线（pipeline）并发框架**：用统一的 `Source / Pipeline / Sink` 抽象把数据处理拆成可组合的模组，并用 `ThreadScheduler` 在全局范围内对 worker 线程总量做“额度”管理。
 
