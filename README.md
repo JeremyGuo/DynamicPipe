@@ -141,28 +141,7 @@ SinkPipeline<T2>  ── Start(total_memory_bytes) 触发“全链路内存预�
 把下面这段直接丢给 Cursor（尽量保持“最小约束 + 明确产出文件”），它就能在当前框架下很快生成一个可编译、可测试、可复用的模组：
 
 ```text
-请在仓库 /home/guojunyi/Projs/ModularDP 中新增一个最小可复用模组：
-
-目标：新增一个中间 Pipeline 模组 `UppercaseModule`，把上游的 `std::string` 转成大写再输出（std::string -> std::string）。
-
-要求：
-1) 新增目录 `modules/uppercase/`，包含：
-   - `uppercase_module.h`（实现类，继承 `Pipeline<std::string, std::string>`）
-   - `uppercase_module.cpp`（如需要；也可 header-only）
-   - `CMakeLists.txt`（生成库 `modulardp_uppercase` 并链接 `modulardp`）
-2) 在 `modules/CMakeLists.txt` 里 `add_subdirectory(uppercase)`。
-3) `UppercaseModule` 必须实现：
-   - `double GetFactor() const override { return 1.0; }`
-   - `void OnMemorySet(std::size_t) override {}`（最小实现即可）
-   - `void Release(std::string&&) override {}`（最小实现即可）
-   - `void Process(std::string&& input) override`：把 input 转大写后 `Emit(...)`；用完后对上游 `Release(std::move(input))`
-4) 新增一个最小测试 `tests/test_uppercase_module.cpp`：
-   - 构造一个 Source 输出几条字符串
-   - 串联 `UppercaseModule` + 一个 Sink 收集结果
-   - 调用 `sink.Start(total_memory_bytes=0, scale_up_interval=2ms)` 并断言输出正确
-5) 更新根 `CMakeLists.txt`：把该测试可执行文件加到 CTest 里，并链接 `modulardp` 与 `modulardp_uppercase`。
-
-请直接修改/新增文件并保证 `cmake --build build -j && ctest --test-dir build --output-on-failure` 可以通过。
+新增一个中间模组 `UppercaseModule`，把上游的 `std::string` 转成大写再输出（std::string -> std::string）。
 ```
 
 ### 构建与运行
