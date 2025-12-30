@@ -428,6 +428,11 @@ private:
             ~Cleanup() noexcept {
                 {
                     std::unique_lock<std::mutex> lock(self->thread_stats_.mutex);
+                    // 关键：把 ThreadScheduler 额度归还也放在同一把锁的临界区内，
+                    // 这样 scaler 线程观测到 active_workers_==0（在同一把锁下）时，
+                    // 能建立 happens-before，保证所有 worker 的 Release() 已经发生，
+                    // 避免 TSAN 报告“栈对象已离开作用域但后台线程仍在访问”的数据竞争。
+                    self->caller_.Release();
                     if (self->thread_stats_.active_workers_ > 0) {
                         self->thread_stats_.active_workers_--;
                     } else {
@@ -435,7 +440,6 @@ private:
                         self->thread_stats_.active_workers_ = 0;
                     }
                 }
-                self->caller_.Release();
             }
         } cleanup{this};
 
