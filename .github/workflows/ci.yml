@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Configure (TSAN)
+        env:
+          CC: clang
+          CXX: clang++
+        run: cmake -S . -B build-tsan -DMODULARDP_ENABLE_TSAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build (TSAN)
+        run: cmake --build build-tsan -j
+
+      - name: Test (TSAN)
+        run: ctest --test-dir build-tsan --output-on-failure
+
+
+

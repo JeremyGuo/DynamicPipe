@@ -1,0 +1,50 @@
+# =========================
+# CMake / build artifacts
+# =========================
+build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+Testing/
+_deps/
+
+# =========================
+# Compiled objects / libs
+# =========================
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.d
+
+# =========================
+# IDE / editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Cursor / tooling caches
+.cache/
+
+# =========================
+# Cursor
+# =========================
+.cursor/*
+!.cursor/
+!.cursor/rules/
+!.cursor/rules/**
+
+

@@ -1,0 +1,321 @@
+### ModularDP 二次开发（给 AI 的 Prompt / 规则文档）
+
+你正在基于本仓库 `/home/guojunyi/Projs/ModularDP` 做二次开发。请严格遵循本文件的约束与约定，优先写出**最小可运行**实现，然后再做扩展。
+
+---
+
+### 1) 这个项目在做什么（核心设计理念）
+
+本项目是一个轻量 C++17 **模块化并发流水线（pipeline）框架**，核心是三类模块抽象：
+
+- **`SourcePipeline<T>`**：只有输出（没有上游输入）。
+- **`SinkPipeline<T>`**：只有输入（没有下游输出）。
+- **`Pipeline<Tin, Tout>`**：中间模块，同时具备输入与输出（`Sink + Source` 组合）。
+
+框架的关键约束/理念：
+
+- **拉取式（pull）**：下游通过 `Get()/GetFor()` 从上游拉数据；结束由 `Get()` 返回 `std::nullopt` 表示。
+- **所有权转移（move-only 友好）**：模块间传递数据统一用 `T` 的“所有权移动”，尽量不拷贝，支持 `std::unique_ptr` 等 move-only 类型。
+- **显式回收（Release 语义）**：下游用完从 `Get()` 拿到的数据后，应该显式调用上游的 `Release(std::move(x))`，用于对象池/句柄回收等；不需要回收时也必须提供空实现以满足接口。
+- **无中心任务队列**：`ThreadScheduler` 只做“全局线程额度”管理，不做任务队列；每个模块自己决定何时扩容/缩容。
+
+相关实现位置：
+
+- 核心抽象：`include/module.h`
+- 线程额度：`include/thread_scheduler.h`
+- 最小示例：`examples/basic_pipeline.cpp`
+- 测试与最佳实践：`tests/test_module.cpp`, `tests/test_stress.cpp`
+
+---
+
+### 2) 三种模块分别负责什么？你需要实现什么？
+
+#### A. Source 模块：`class XxxSource : public SourcePipeline<Tout>`
+
+**职责**
+
+- 生产数据，并通过 `Emit(Tout)` 交给下游。
+- 数据生产结束后必须 `CloseOutput()`，让下游收到终止信号（`Get()` 返回 `nullopt`）。
+
+**你必须实现**
+
+- `void Release(Tout&& data) override;`
+  - 语义：下游处理完从 `Get()` 拿到的 `Tout` 后归还给 Source。
+  - 如果 `Tout` 是值类型且无资源回收需求：可以空实现。
+  - 如果使用对象池/缓存：在这里回收对象。
+
+- `void OnMemorySet(std::size_t memory_bytes) override;`
+  - 语义：框架为该模块计算出“内存配额（字节）”后会调用该回调。
+  - 你可以在这里初始化对象池/缓冲区；不需要时可空实现。
+  - 建议：大多数 Source 不需要显著内存预算，可以 override `HasFactor()` 返回 false，让它收到 `OnMemorySet(0)` 且不参与后续的内存比例分配。
+    - 如果你的 Source 确实需要内存预算（例如大 buffer / arena），保持 `HasFactor()==true`（默认）即可。
+
+**你通常还需要做**
+
+- 用一个生产线程（或外部回调）循环 `Emit`，最后 `CloseOutput()`。
+- 在析构中 join 生产线程，避免悬空访问。
+
+#### B. Sink 模块：`class XxxSink : public SinkPipeline<Tin>`
+
+**职责**
+
+- 从上游拉取 `Tin`，执行终端处理（写文件、打印、落库、统计、输出等）。
+- 不产生下游输出。
+
+**你必须实现**
+
+- `void Process(Tin&& input) override;`
+  - 重要：`Process` **接管 input 的所有权**。
+  - 如果需要把 input 归还给上游回收：调用 `GetUpstream()->Release(std::move(input))`。
+
+- `double GetFactor() const override;`
+  - 语义：该模块相对“上一个模块”的内存倍率（\(memory_{this} / memory_{prev}\)）。
+  - 框架会收集整条链的 factor，并把 `total_memory_bytes` 按比例分配给每个模块（见下方 HasFactor 规则）。
+
+- `void OnMemorySet(std::size_t memory_bytes) override;`
+
+**运行方式（必须遵守）**
+
+- 构造：`XxxSink(ThreadScheduler& scheduler, SourcePipeline<Tin>* upstream)`
+- 启动：
+  - `sink.Start(total_memory_bytes, opt)`（只能调用一次）
+    - `total_memory_bytes` 表示**整条链**的总内存预算（字节）
+    - 框架会先对每个模块调用 `OnMemorySet(memory_i)`，然后再按**上游 -> 下游**顺序启动模块
+    - 若暂不需要内存预算：传 `total_memory_bytes = 0`
+- 等待：`sink.WaitForCompletion()`
+
+**异常约束**
+
+- `Process()` 内尽量不要抛异常。框架会吞掉异常并让该 worker 退出（避免跨线程边界 `std::terminate`），但这会导致处理提前停止。
+
+#### C. Pipeline 中间模块：`class XxxPipeline : public Pipeline<Tin, Tout>`
+
+**职责**
+
+- 从上游拉取 `Tin`，处理后产生 `Tout`，并用 `Emit(Tout)` 发给下游。
+- 所有 worker 结束后，默认会自动关闭输出（`Pipeline` 覆盖了 `OnAllWorkersDone()` -> `CloseOutput()`）。
+
+**你必须实现**
+
+- `void Process(Tin&& input) override;`
+  - 用完输入后按需 `GetUpstream()->Release(std::move(input))`
+  - 处理结果用 `Emit(result)` 输出
+- `void Release(Tout&& data) override;`
+  - 语义：下游用完你输出的 `Tout` 后归还给你
+  - 若无回收需求可空实现
+
+- `double GetFactor() const override;`
+- `void OnMemorySet(std::size_t memory_bytes) override;`
+
+---
+
+### 3) 自动扩缩容与线程额度（理解运行机制，避免写错）
+
+- `SinkPipeline` 内部有一个 scaler 线程，周期性评估扩缩容（`AutoScaleOptions::scale_up_interval`）。
+- worker 通过 `upstream->GetFor(0.8 * interval)` 拉取数据：
+  - **超时**不等于结束：若 `upstream->IsDrained()` 才表示彻底结束。
+  - 若频繁超时，会触发缩容逻辑（worker 自行退出）。
+- 扩容条件（简化理解）：当本轮没有 timeout，且 `upstream->GetQueuedCount()` 的 backlog 大于当前 worker 数，会尝试创建新 worker。
+- **全局线程上限**由 `ThreadScheduler` 控制：创建 worker 前会 `TryAcquire()`，worker 退出会 `Release()` 归还额度。
+
+建议：
+
+- 对于测试/小任务，把 `scale_up_interval` 设小一点（例如 1~5ms），否则 `WaitForCompletion()` 可能因为 scaler 的 sleep 看起来“变慢”。
+- **启动建议**：只调用“最后一个 Sink”的 `Start(total_memory_bytes, opt)`；它会自动按上游->下游启动整条链（见 `tests/test_stress.cpp`）。
+
+---
+
+### 4) 最小示例（可直接照抄的骨架）
+
+下面是一个最小 pipeline：
+
+`CounterSource(int) -> DoublerPipeline(int->int) -> PrintSink(int)`
+
+```cpp
+#include <module.h>
+
+#include <iostream>
+#include <thread>
+
+class CounterSource final : public SourcePipeline<int> {
+public:
+    explicit CounterSource(int n) : n_(n) {
+        producer_ = std::thread([this] {
+            for (int i = 0; i < n_; ++i) Emit(i);
+            CloseOutput();
+        });
+    }
+
+    ~CounterSource() override {
+        if (producer_.joinable()) producer_.join();
+    }
+
+    void Release(int&&) override {
+        // 值类型无需回收，也必须实现该接口
+    }
+
+    void OnMemorySet(std::size_t /*memory_bytes*/) override {}
+
+private:
+    int n_;
+    std::thread producer_;
+};
+
+class DoublerPipeline final : public Pipeline<int, int> {
+public:
+    DoublerPipeline(ThreadScheduler& scheduler, SourcePipeline<int>* upstream)
+        : Pipeline<int, int>(scheduler, upstream) {}
+
+    double GetFactor() const override { return 1.0; }
+
+    void Release(int&&) override {}
+
+    void OnMemorySet(std::size_t /*memory_bytes*/) override {}
+
+protected:
+    void Process(int&& input) override {
+        // 用完 input 后归还上游（如果上游有对象池，这一步很重要）
+        if (auto* up = GetUpstream()) up->Release(std::move(input));
+        Emit(input * 2);
+    }
+};
+
+class PrintSink final : public SinkPipeline<int> {
+public:
+    PrintSink(ThreadScheduler& scheduler, SourcePipeline<int>* upstream)
+        : SinkPipeline<int>(scheduler, upstream) {}
+
+    double GetFactor() const override { return 1.0; }
+
+    void OnMemorySet(std::size_t /*memory_bytes*/) override {}
+
+protected:
+    void Process(int&& input) override {
+        std::cout << input << "\n";
+        if (auto* up = GetUpstream()) up->Release(std::move(input));
+    }
+};
+
+int main() {
+    ThreadScheduler scheduler(ThreadScheduler::Options(/*max_total_threads=*/4));
+
+    CounterSource source(10);
+    DoublerPipeline p(scheduler, &source);
+    PrintSink sink(scheduler, &p);
+
+    // 推荐用法：只启动最后一个 Sink，并给“整条链”的总内存预算（字节）
+    sink.Start(/*total_memory_bytes=*/1024 * 1024);
+
+    p.WaitForCompletion();
+    sink.WaitForCompletion();
+}
+```
+
+---
+
+### 5) 二次开发：推荐的目录结构（modules/）
+
+本仓库已提供 `modules/` 入口（根 `CMakeLists.txt` 会 `add_subdirectory(modules)`）。二次开发时请按如下结构组织（便于扩展与复用）：
+
+```
+modules/
+  <module_name>/
+    CMakeLists.txt
+    <module_name>.h
+    <module_name>.cpp   // 也可 .cc
+    README.md           // 可选：描述模块输入输出、线程模型、性能等
+```
+
+约定：
+
+- 模块的公共 API 放 `<module_name>.h`，实现放 `<module_name>.cpp`。
+- 头文件里只暴露必要类型；尽量把重实现细节藏到 `.cpp`（如果你希望提供一个编译后的库）。
+- 若你希望继续保持 header-only，也可以只提供 `.h`，`.cpp` 为空或不创建，但请保持结构一致。
+
+---
+
+### 6) CMake 集成方式（新增模块如何被编译/链接）
+
+项目核心库是接口库：
+
+- `add_library(modulardp INTERFACE)`，只提供 include 路径（见根目录 `CMakeLists.txt`）。
+
+因此你新增模块通常有两种方式：
+
+**方式 1：你的模块也做成 INTERFACE（header-only）**
+
+- 在 `modules/<name>/CMakeLists.txt` 中定义：
+  - `add_library(modulardp_<name> INTERFACE)`
+  - `target_link_libraries(modulardp_<name> INTERFACE modulardp)`
+  - `target_include_directories(modulardp_<name> INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})`
+
+**方式 2：你的模块做成静态/动态库（有 .cpp）**
+
+- `add_library(modulardp_<name> STATIC <module_name>.cpp)`
+- `target_link_libraries(modulardp_<name> PUBLIC modulardp)`
+- `target_include_directories(modulardp_<name> PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})`
+
+然后在你新增的 example/test 可执行文件中：
+
+- `target_link_libraries(your_app PRIVATE modulardp modulardp_<name> ...)`
+
+---
+
+### 7) 写模块时最容易踩的坑（必须规避）
+
+- **忘记 `CloseOutput()`**：Source 不关闭输出会导致下游永久阻塞/Wait 永不返回。
+- **忘记 `Release()`**：如果你未来引入对象池/引用计数，忘记 Release 会造成内存/句柄泄漏或背压失效。
+- **手动分段启动**：除非你明确要启动“某一段子链”，否则不要手动对中间 `Pipeline` 调 `Start(...)`；推荐只启动最后一个 Sink。
+- **在 `Process()` 抛异常**：worker 会退出；错误处理建议用“错误值”下传或内部捕获并记录。
+- **跨线程共享状态没加锁**：Sink/ Pipeline 内如果写入共享容器（如 `std::vector`），请用 mutex 或无锁结构。
+
+---
+
+### 7.1) Source 是否需要“延迟启动”？
+
+框架启动入口在最后一个 Sink：它会先给每个模块分配内存并调用 `OnMemorySet()`，然后调用每个模块的 `StartAfterMemory(opt)`。
+
+- **默认行为**：`SourcePipeline` 不会自动创建 producer（`ModuleBase::StartAfterMemory` 默认是空实现）。
+- **推荐做法**：
+  - 如果你的 Source 在构造时就能启动生产线程：保持现在写法即可。
+  - 如果你的 Source 需要等 `OnMemorySet()` 拿到对象池/缓冲区后再启动：请覆写 `StartAfterMemory(opt)`，在里面启动 producer，并在析构时 join。
+
+---
+
+### 7.2) 模组不要自定义“内存限制选项”
+
+**强烈建议**：在设计模组时，不要再额外定义诸如 `max_memory_mb / cache_limit / buffer_bytes` 这类“内存上限”配置项并要求用户传入。
+
+- **唯一内存预算入口**：通过 `OnMemorySet(std::size_t memory_bytes)` 获取该模块可用内存预算。
+- **比例关系**：通过 `GetFactor()` 定义模块间内存比例，`sink.Start(total_memory_bytes, opt)` 会按整条链自动分配到每个模块。
+- **实现方式**：在 `OnMemorySet(memory_bytes)` 里按预算初始化/调整对象池、缓存、环形缓冲区、IO block size 等；不要把这些预算再做成一个外部选项。
+
+---
+
+### 7.3) HasFactor 规则（决定从哪里开始分配内存）
+
+`ModuleBase` 提供：
+
+- `bool HasFactor() const`
+  - **默认 true**（是否参与后续的比例分配由具体模块决定）
+
+内存分配规则（在调用最后一个 sink 的 `Start(total_memory_bytes, opt)` 时生效）：
+
+- 从 sink 回溯整条链后，框架会找到“**最后一个 `HasFactor()==false` 的模块**”，并把该模块及其更上游模块视为“几乎不占用内存”：
+  - 这些模块会收到 `OnMemorySet(0)`
+- 从它的下一个模块开始（更靠下游），才会把 `total_memory_bytes` 按 `GetFactor()` 链做比例分配。
+
+
+---
+
+### 8) 当你不确定时（对 AI 的强制执行指令）
+
+如果你要新增一个模块但信息不足，请优先：
+
+- 先实现一个“值类型、无对象池、Release 空实现”的最小版本；
+- 写一个 example 把模块串起来跑通；
+- 再根据性能/复用目标引入对象池与 Release 回收逻辑。
+
+---
+alwaysApply: true
+---
