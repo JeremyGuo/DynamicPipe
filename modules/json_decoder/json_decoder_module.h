@@ -195,7 +195,10 @@ public:
     void* Malloc(std::size_t size);
     void Free(void* ptr);
 
-    void SetWaitObserver(std::function<void(bool)> observer) { wait_observer_ = std::move(observer); }
+    void SetWaitObserver(std::function<void(bool)> observer) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        wait_observer_ = std::move(observer);
+    }
 
 private:
     static constexpr std::size_t Align(std::size_t size) {
