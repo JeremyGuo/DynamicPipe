@@ -402,6 +402,70 @@ protected:
     virtual void OnAllWorkersDone() {}
 
     /**
+     * @brief 统计当前模块中是否有 worker 正在等待内部的内存资源。
+     * @note 需要由具体模块在“可能阻塞的内存申请”附近使用，避免在内存紧张时继续扩容线程。
+     *
+     * 用法示例：
+     * @code
+     * {
+     *     auto mem_guard = TrackMemoryRequest();
+     *     // 这里进行可能阻塞的内存申请
+     * }
+     * @endcode
+     */
+    class ScopedMemoryRequestGuard {
+    public:
+        ScopedMemoryRequestGuard() noexcept : self_(nullptr), engaged_(false) {}
+
+        explicit ScopedMemoryRequestGuard(SinkPipeline* self) : self_(self), engaged_(false) {
+            Enter_();
+        }
+
+        ScopedMemoryRequestGuard(const ScopedMemoryRequestGuard&) = delete;
+        ScopedMemoryRequestGuard& operator=(const ScopedMemoryRequestGuard&) = delete;
+
+        ScopedMemoryRequestGuard(ScopedMemoryRequestGuard&& other) noexcept
+            : self_(other.self_), engaged_(other.engaged_) {
+            other.self_ = nullptr;
+            other.engaged_ = false;
+        }
+
+        ScopedMemoryRequestGuard& operator=(ScopedMemoryRequestGuard&& other) noexcept {
+            if (this == &other) return *this;
+            Exit_();
+            self_ = other.self_;
+            engaged_ = other.engaged_;
+            other.self_ = nullptr;
+            other.engaged_ = false;
+            return *this;
+        }
+
+        ~ScopedMemoryRequestGuard() { Exit_(); }
+
+    private:
+        void Enter_() {
+            if (!self_) return;
+            std::lock_guard<std::mutex> lock(self_->thread_stats_.mutex);
+            self_->thread_stats_.memory_requesting_workers_++;
+            engaged_ = true;
+        }
+
+        void Exit_() {
+            if (!self_ || !engaged_) return;
+            std::lock_guard<std::mutex> lock(self_->thread_stats_.mutex);
+            if (self_->thread_stats_.memory_requesting_workers_ > 0) {
+                self_->thread_stats_.memory_requesting_workers_--;
+            }
+            engaged_ = false;
+        }
+
+        SinkPipeline* self_;
+        bool engaged_;
+    };
+
+    ScopedMemoryRequestGuard TrackMemoryRequest() { return ScopedMemoryRequestGuard(this); }
+
+    /**
      * @brief 获取上游模块指针（供子类使用）
      */
     SourcePipeline<Tin>* GetUpstream() const {
@@ -505,7 +569,8 @@ private:
 
                 // Check if we need to scale up
                 const auto backlog_count = upstream_->GetQueuedCount();
-                if (thread_stats_.num_timeouts_ == 0 &&
+                const bool has_memory_waiter = thread_stats_.memory_requesting_workers_ > 0;
+                if (!has_memory_waiter && thread_stats_.num_timeouts_ == 0 &&
                     backlog_count > thread_stats_.active_workers_) {
                     // 关键：先记账（reserve），再创建线程，避免 worker 先退出导致 active_workers_ 下溢/变负。
                     thread_stats_.desired_workers_++;
@@ -575,6 +640,9 @@ protected:
 
         // 当前检查区间是否发生过timeout_，如果有，说明worker足够多，不能创建新线程
         std::size_t num_timeouts_;
+
+        // 有多少 worker 正在等待模块内部的内存资源（例如 arena 块）。
+        std::size_t memory_requesting_workers_;
 
         std::mutex mutex;
     } thread_stats_;

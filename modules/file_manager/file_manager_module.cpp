@@ -294,6 +294,7 @@ std::optional<FileManagerModule::Block> FileManagerModule::AcquireBlock_(std::si
     };
 
     if (allow_wait) {
+        auto mem_guard = TrackMemoryRequest();
         buffer_cv_.wait(lock, can_alloc);
         if (this->should_stop_) return std::nullopt;
         if (!HasBlockFor_(size)) return std::nullopt;
