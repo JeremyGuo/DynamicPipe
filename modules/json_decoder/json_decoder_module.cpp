@@ -148,20 +148,31 @@ void* DecoderMemoryPool::Malloc(std::size_t size)
     std::unique_lock<std::mutex> lock(mutex_);
 
     BlockHeader* block = FindFreeBlock(total_size);
-    while (!block) {
+
+    if (!block) {
         struct WaitGuard {
-            explicit WaitGuard(std::function<void(bool)> observer) : observer_(std::move(observer))
+            explicit WaitGuard(std::function<void(bool)> observer)
+                : observer_(std::move(observer))
             {
-                if (observer_) observer_(true);
+                if (observer_) {
+                    observer_(true);
+                }
             }
-            ~WaitGuard() { if (observer_) observer_(false); }
+            ~WaitGuard()
+            {
+                if (observer_) {
+                    observer_(false);
+                }
+            }
             std::function<void(bool)> observer_;
         } guard(wait_observer_);
 
-        alloc_cv_.wait(lock, [&] {
-            block = FindFreeBlock(total_size);
-            return block != nullptr;
-        });
+        while (!block) {
+            alloc_cv_.wait(lock, [&] {
+                block = FindFreeBlock(total_size);
+                return block != nullptr;
+            });
+        }
     }
 
     SplitBlock(block, total_size);
