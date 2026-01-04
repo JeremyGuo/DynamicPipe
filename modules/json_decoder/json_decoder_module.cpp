@@ -429,9 +429,15 @@ void JsonDecoderModule::OnMemorySet(std::size_t memory_bytes)
     decoder_memory_pool_->SetWaitObserver([this](bool entering) {
         thread_local std::optional<MemoryWaitGuard> guard;
         if (entering) {
-            guard.emplace(this->TrackMemoryRequest());
+            // Only create a new guard if one is not already active for this thread.
+            if (!guard) {
+                guard.emplace(this->TrackMemoryRequest());
+            }
         } else {
-            guard.reset();
+            // Only reset the guard if it is currently active.
+            if (guard) {
+                guard.reset();
+            }
         }
     });
 }
