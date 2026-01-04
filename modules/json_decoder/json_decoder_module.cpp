@@ -208,7 +208,7 @@ void DecoderMemoryPool::Free(void* ptr)
     block = Coalesce(block);
     InsertFreeBlock(block);
 
-    alloc_cv_.notify_one();
+    alloc_cv_.notify_all();
 }
 
 DecoderMemoryPool::BlockHeader* DecoderMemoryPool::InitializeFirstBlock()
