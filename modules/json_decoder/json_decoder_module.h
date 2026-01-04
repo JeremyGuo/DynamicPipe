@@ -5,6 +5,8 @@
 #include "file_chunk.h"
 
 #include <filesystem>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 #include <memory>
@@ -157,6 +159,8 @@ private:
      */
     void ReleaseChunkIfUnused(const char* data_ptr);
 
+    using MemoryWaitGuard = typename SinkPipeline<FileChunk>::ScopedMemoryRequestGuard;
+
     // FileChunk 引用计数管理（使用 unordered_map + lock）
     // 使用 data 指针作为键，因为每个内存池块的数据指针是唯一的
     mutable std::mutex ref_count_mutex_;
@@ -190,6 +194,8 @@ public:
     // Allocator 接口
     void* Malloc(std::size_t size);
     void Free(void* ptr);
+
+    void SetWaitObserver(std::function<void(bool)> observer) { wait_observer_ = std::move(observer); }
 
 private:
     static constexpr std::size_t Align(std::size_t size) {
@@ -234,6 +240,8 @@ private:
     std::size_t chunk_size_ = 0;  // 记录建议 chunk 大小（供统计用）
 
     std::mutex mutex_;
+    std::condition_variable alloc_cv_;
+    std::function<void(bool)> wait_observer_;
     BlockHeader* head_block_ = nullptr;      // 整个 arena 的起始块
     BlockHeader* free_list_head_ = nullptr;  // 空闲块链表
     bool fallback_mode_ = false;      // 当未配置内存池时，退化为标准分配

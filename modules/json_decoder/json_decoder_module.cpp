@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <cstdlib>
+#include <optional>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -144,11 +145,23 @@ void* DecoderMemoryPool::Malloc(std::size_t size)
 
     const std::size_t total_size = Align(size) + HeaderSize();
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
 
     BlockHeader* block = FindFreeBlock(total_size);
-    if (!block) {
-        return nullptr;
+    while (!block) {
+        struct WaitGuard {
+            explicit WaitGuard(std::function<void(bool)> observer) : observer_(std::move(observer))
+            {
+                if (observer_) observer_(true);
+            }
+            ~WaitGuard() { if (observer_) observer_(false); }
+            std::function<void(bool)> observer_;
+        } guard(wait_observer_);
+
+        alloc_cv_.wait(lock, [&] {
+            block = FindFreeBlock(total_size);
+            return block != nullptr;
+        });
     }
 
     SplitBlock(block, total_size);
@@ -183,6 +196,8 @@ void DecoderMemoryPool::Free(void* ptr)
     block->free = true;
     block = Coalesce(block);
     InsertFreeBlock(block);
+
+    alloc_cv_.notify_one();
 }
 
 DecoderMemoryPool::BlockHeader* DecoderMemoryPool::InitializeFirstBlock()
@@ -399,6 +414,15 @@ void JsonDecoderModule::OnMemorySet(std::size_t memory_bytes)
         memory_bytes,
         opt_.mmap_file_path,
         decoder_chunk_size_);
+
+    decoder_memory_pool_->SetWaitObserver([this](bool entering) {
+        thread_local std::optional<MemoryWaitGuard> guard;
+        if (entering) {
+            guard.emplace(this->TrackMemoryRequest());
+        } else {
+            guard.reset();
+        }
+    });
 }
 
 void JsonDecoderModule::Release(DecodedJson&& data)
